@@ -937,6 +937,8 @@ class AccuracyReward(ORM):
         logger.info(f"Accuracy reward call #{step_count}")
         
         from math_verify import LatexExtractionConfig, parse, verify
+        from sympy import sympify, Symbol, solve, Eq
+        import re
         
         # Get solutions from solution key directly
         if "solution" not in kwargs:
@@ -962,29 +964,79 @@ class AccuracyReward(ORM):
         # Ensure solutions and completions have matching lengths
         if len(solutions) != len(completion_contents):
             logger.warning(f"Number of solutions ({len(solutions)}) does not match completions ({len(completion_contents)})")
-            # Truncate the longer list to match the shorter list
             min_len = min(len(solutions), len(completion_contents))
             solutions = solutions[:min_len]
             completion_contents = completion_contents[:min_len]
+        
+        def extract_math_expression(text):
+            """Extract mathematical expression from text."""
+            # Try to find expressions in LaTeX format
+            latex_pattern = r'\$.*?\$|\\\(.*?\\\)|\\\[.*?\\\]'
+            matches = re.findall(latex_pattern, text)
+            if matches:
+                return matches[0].strip('$()[]\\')
+            
+            # Try to find boxed answers
+            boxed_pattern = r'\\boxed\{.*?\}'
+            matches = re.findall(boxed_pattern, text)
+            if matches:
+                return matches[0].replace('\\boxed{', '').replace('}', '')
+            
+            return text.strip()
+        
+        def safe_verify(expr1, expr2):
+            """Safely verify two mathematical expressions."""
+            try:
+                # First try direct verification
+                return float(verify(expr1, expr2))
+            except Exception as e:
+                try:
+                    # If direct verification fails, try symbolic comparison
+                    sympy_expr1 = sympify(expr1)
+                    sympy_expr2 = sympify(expr2)
+                    
+                    # If both expressions are equations
+                    if isinstance(sympy_expr1, Eq) and isinstance(sympy_expr2, Eq):
+                        # Solve both equations and compare solutions
+                        var = Symbol('x')
+                        sol1 = solve(sympy_expr1, var)
+                        sol2 = solve(sympy_expr2, var)
+                        return float(len(set(sol1) & set(sol2)) > 0)
+                    
+                    # If expressions are not equations, compare them directly
+                    return float(sympy_expr1.equals(sympy_expr2))
+                except Exception as e2:
+                    logger.warning(f"Error in symbolic comparison: {str(e2)[:200]}")
+                    return 0.0
         
         # Calculate rewards
         rewards = []
         for content, solution in zip(completion_contents, solutions):
             try:
-                gold_parsed = parse(solution, extraction_mode="first_match", extraction_config=[LatexExtractionConfig()])
-                answer_parsed = parse(content, extraction_mode="first_match", extraction_config=[LatexExtractionConfig()])
+                # Extract mathematical expressions
+                content_expr = extract_math_expression(content)
+                solution_expr = extract_math_expression(solution)
                 
-                if len(gold_parsed) != 0:
-                    try:
-                        reward = float(verify(answer_parsed, gold_parsed))
-                        rewards.append(reward)
-                    except Exception as e:
-                        logger.warning(f"Verification error: {e}")
-                        rewards.append(0.0)
-                else:
-                    rewards.append(1.0)
+                # Parse expressions
+                try:
+                    gold_parsed = parse(solution_expr, extraction_mode="first_match", 
+                                     extraction_config=[LatexExtractionConfig()])
+                    answer_parsed = parse(content_expr, extraction_mode="first_match", 
+                                       extraction_config=[LatexExtractionConfig()])
+                    
+                    if len(gold_parsed) != 0:
+                        reward = safe_verify(answer_parsed, gold_parsed)
+                    else:
+                        # If parsing fails, try direct string comparison
+                        reward = float(content_expr.strip() == solution_expr.strip())
+                except Exception as e:
+                    logger.warning(f"Error in expression parsing: {str(e)[:200]}")
+                    # Fallback to direct string comparison
+                    reward = float(content_expr.strip() == solution_expr.strip())
+                
+                rewards.append(reward)
             except Exception as e:
-                logger.warning(f"Error in accuracy_reward: {e}")
+                logger.warning(f"Error in accuracy_reward: {str(e)[:200]}")
                 rewards.append(0.0)
         
         # Calculate average reward and update latest_rewards
@@ -1441,19 +1493,47 @@ class TextSimilarityReward(ORM):
                 if len(rewards) < len(completions):
                     rewards.extend([0.0] * (len(completions) - len(rewards)))
                 
-                # 更新全局奖励值
+                # 计算统计信息
                 avg_reward = sum(rewards) / len(rewards) if rewards else 0
+                min_reward = min(rewards) if rewards else 0
+                max_reward = max(rewards) if rewards else 0
+                std_reward = (sum((r - avg_reward) ** 2 for r in rewards) / len(rewards)) ** 0.5 if rewards else 0
+                
+                # 更新全局奖励值
                 latest_rewards["text_similarity_reward"] = avg_reward
                 
                 # 记录到wandb
                 if wandb.run is not None:
+                    # 基础指标
                     wandb.log({
                         "text_similarity_reward": avg_reward,
                         "text_similarity_reward_step": step_count,
                         "text_similarity_rewards_raw": rewards,
-                        "text_similarity_reward_min": min(rewards) if rewards else 0,
-                        "text_similarity_reward_max": max(rewards) if rewards else 0,
+                        "text_similarity_reward_min": min_reward,
+                        "text_similarity_reward_max": max_reward,
+                        "text_similarity_reward_std": std_reward,
                     }, step=step_count)
+                    
+                    # 添加详细的统计信息
+                    wandb.log({
+                        "text_similarity_stats/mean": avg_reward,
+                        "text_similarity_stats/std": std_reward,
+                        "text_similarity_stats/min": min_reward,
+                        "text_similarity_stats/max": max_reward,
+                        "text_similarity_stats/median": sorted(rewards)[len(rewards)//2] if rewards else 0,
+                        "text_similarity_stats/num_samples": len(rewards),
+                    }, step=step_count)
+                    
+                    # 记录一些示例文本的相似度
+                    if rewards:
+                        for i, (comp, sol, reward) in enumerate(zip(completion_texts[:3], solution_texts[:3], rewards[:3])):
+                            wandb.log({
+                                f"text_similarity_examples/example_{i}/completion": comp,
+                                f"text_similarity_examples/example_{i}/solution": sol,
+                                f"text_similarity_examples/example_{i}/similarity": reward,
+                            }, step=step_count)
+                    
+                    logger.info(f"LOG to wandb: text_similarity_reward={avg_reward:.4f} (min={min_reward:.4f}, max={max_reward:.4f}, std={std_reward:.4f}) at step {step_count}")
                 
                 return rewards
                 
