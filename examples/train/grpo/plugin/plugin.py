@@ -1430,21 +1430,71 @@ class TextSimilarityReward(ORM):
             ngram_range=(1, 2),
             stop_words='english'
         )
-        # 确保wandb已初始化
-        self._ensure_wandb_init()
+        self._wandb_init = False
+        self._wandb_retry_count = 0
+        self._max_retries = 3
+        self._wandb_metrics_buffer = []
         
     def _ensure_wandb_init(self):
-        """确保wandb已初始化"""
-        if not hasattr(self, '_wandb_init'):
-            self._wandb_init = False
-        if not self._wandb_init:
+        """确保wandb已初始化，包含重试机制"""
+        if self._wandb_init:
+            return True
+            
+        if self._wandb_retry_count >= self._max_retries:
+            logger.warning("Max wandb initialization retries reached. Continuing without wandb logging.")
+            return False
+            
+        try:
+            if wandb.run is None:
+                # 设置更长的超时时间
+                wandb.init(
+                    project="GRPO-Training",
+                    resume="allow",
+                    settings=wandb.Settings(
+                        start_method="thread",
+                        timeout=60,
+                        _disable_stats=True
+                    )
+                )
+            self._wandb_init = True
+            logger.info("Wandb initialized for TextSimilarityReward")
+            return True
+        except Exception as e:
+            self._wandb_retry_count += 1
+            logger.warning(f"Failed to initialize wandb (attempt {self._wandb_retry_count}/{self._max_retries}): {str(e)[:200]}")
+            return False
+            
+    def _safe_wandb_log(self, metrics, step):
+        """安全地记录wandb指标，包含缓冲机制"""
+        if not self._ensure_wandb_init():
+            # 如果初始化失败，将指标添加到缓冲区
+            self._wandb_metrics_buffer.append((metrics, step))
+            return
+            
+        try:
+            wandb.log(metrics, step=step, commit=True)
+        except Exception as e:
+            logger.warning(f"Error logging to wandb: {str(e)[:200]}")
+            # 将失败的指标添加到缓冲区
+            self._wandb_metrics_buffer.append((metrics, step))
+            
+    def _flush_wandb_buffer(self):
+        """尝试刷新wandb缓冲区"""
+        if not self._wandb_metrics_buffer:
+            return
+            
+        if not self._ensure_wandb_init():
+            return
+            
+        remaining_metrics = []
+        for metrics, step in self._wandb_metrics_buffer:
             try:
-                if wandb.run is None:
-                    wandb.init(project="GRPO-Training", resume="allow")
-                self._wandb_init = True
-                logger.info("Wandb initialized for TextSimilarityReward")
+                wandb.log(metrics, step=step, commit=True)
             except Exception as e:
-                logger.warning(f"Failed to initialize wandb: {str(e)[:200]}")
+                logger.warning(f"Error flushing buffered metrics to wandb: {str(e)[:200]}")
+                remaining_metrics.append((metrics, step))
+                
+        self._wandb_metrics_buffer = remaining_metrics
     
     def __call__(self, completions, **kwargs) -> List[float]:
         """Reward function that computes text similarity between completions and solutions"""
@@ -1453,9 +1503,6 @@ class TextSimilarityReward(ORM):
         step_count = reward_call_counts["text_similarity"]
         
         logger.info(f"Text Similarity reward call #{step_count}")
-        
-        # 确保wandb已初始化
-        self._ensure_wandb_init()
         
         # 默认返回全零数组
         default_return = [0.0] * len(completions)
@@ -1520,41 +1567,43 @@ class TextSimilarityReward(ORM):
                 # 更新全局奖励值
                 latest_rewards["text_similarity_reward"] = avg_reward
                 
-                # 记录到wandb
-                if wandb.run is not None:
-                    try:
-                        # 基础指标
-                        wandb.log({
-                            "text_similarity_reward": avg_reward,
-                            "text_similarity_reward_step": step_count,
-                            "text_similarity_rewards_raw": rewards,
-                            "text_similarity_reward_min": min_reward,
-                            "text_similarity_reward_max": max_reward,
-                            "text_similarity_reward_std": std_reward,
-                        }, step=step_count, commit=True)  # 添加commit=True确保立即提交
-                        
-                        # 添加详细的统计信息
-                        wandb.log({
-                            "text_similarity_stats/mean": avg_reward,
-                            "text_similarity_stats/std": std_reward,
-                            "text_similarity_stats/min": min_reward,
-                            "text_similarity_stats/max": max_reward,
-                            "text_similarity_stats/median": sorted(rewards)[len(rewards)//2] if rewards else 0,
-                            "text_similarity_stats/num_samples": len(rewards),
-                        }, step=step_count, commit=True)  # 添加commit=True确保立即提交
-                        
-                        # 记录一些示例文本的相似度
-                        if rewards:
-                            for i, (comp, sol, reward) in enumerate(zip(completion_texts[:3], solution_texts[:3], rewards[:3])):
-                                wandb.log({
-                                    f"text_similarity_examples/example_{i}/completion": comp,
-                                    f"text_similarity_examples/example_{i}/solution": sol,
-                                    f"text_similarity_examples/example_{i}/similarity": reward,
-                                }, step=step_count, commit=True)  # 添加commit=True确保立即提交
-                        
-                        logger.info(f"LOG to wandb: text_similarity_reward={avg_reward:.4f} (min={min_reward:.4f}, max={max_reward:.4f}, std={std_reward:.4f}) at step {step_count}")
-                    except Exception as e:
-                        logger.warning(f"Error logging to wandb: {str(e)[:200]}")
+                # 准备wandb指标
+                base_metrics = {
+                    "text_similarity_reward": avg_reward,
+                    "text_similarity_reward_step": step_count,
+                    "text_similarity_rewards_raw": rewards,
+                    "text_similarity_reward_min": min_reward,
+                    "text_similarity_reward_max": max_reward,
+                    "text_similarity_reward_std": std_reward,
+                }
+                
+                stats_metrics = {
+                    "text_similarity_stats/mean": avg_reward,
+                    "text_similarity_stats/std": std_reward,
+                    "text_similarity_stats/min": min_reward,
+                    "text_similarity_stats/max": max_reward,
+                    "text_similarity_stats/median": sorted(rewards)[len(rewards)//2] if rewards else 0,
+                    "text_similarity_stats/num_samples": len(rewards),
+                }
+                
+                # 安全地记录到wandb
+                self._safe_wandb_log(base_metrics, step_count)
+                self._safe_wandb_log(stats_metrics, step_count)
+                
+                # 记录示例
+                if rewards:
+                    for i, (comp, sol, reward) in enumerate(zip(completion_texts[:3], solution_texts[:3], rewards[:3])):
+                        example_metrics = {
+                            f"text_similarity_examples/example_{i}/completion": comp,
+                            f"text_similarity_examples/example_{i}/solution": sol,
+                            f"text_similarity_examples/example_{i}/similarity": reward,
+                        }
+                        self._safe_wandb_log(example_metrics, step_count)
+                
+                # 尝试刷新缓冲区
+                self._flush_wandb_buffer()
+                
+                logger.info(f"LOG to wandb: text_similarity_reward={avg_reward:.4f} (min={min_reward:.4f}, max={max_reward:.4f}, std={std_reward:.4f}) at step {step_count}")
                 
                 return rewards
                 
