@@ -1430,6 +1430,21 @@ class TextSimilarityReward(ORM):
             ngram_range=(1, 2),
             stop_words='english'
         )
+        # 确保wandb已初始化
+        self._ensure_wandb_init()
+        
+    def _ensure_wandb_init(self):
+        """确保wandb已初始化"""
+        if not hasattr(self, '_wandb_init'):
+            self._wandb_init = False
+        if not self._wandb_init:
+            try:
+                if wandb.run is None:
+                    wandb.init(project="GRPO-Training", resume="allow")
+                self._wandb_init = True
+                logger.info("Wandb initialized for TextSimilarityReward")
+            except Exception as e:
+                logger.warning(f"Failed to initialize wandb: {str(e)[:200]}")
     
     def __call__(self, completions, **kwargs) -> List[float]:
         """Reward function that computes text similarity between completions and solutions"""
@@ -1438,6 +1453,9 @@ class TextSimilarityReward(ORM):
         step_count = reward_call_counts["text_similarity"]
         
         logger.info(f"Text Similarity reward call #{step_count}")
+        
+        # 确保wandb已初始化
+        self._ensure_wandb_init()
         
         # 默认返回全零数组
         default_return = [0.0] * len(completions)
@@ -1504,36 +1522,39 @@ class TextSimilarityReward(ORM):
                 
                 # 记录到wandb
                 if wandb.run is not None:
-                    # 基础指标
-                    wandb.log({
-                        "text_similarity_reward": avg_reward,
-                        "text_similarity_reward_step": step_count,
-                        "text_similarity_rewards_raw": rewards,
-                        "text_similarity_reward_min": min_reward,
-                        "text_similarity_reward_max": max_reward,
-                        "text_similarity_reward_std": std_reward,
-                    }, step=step_count)
-                    
-                    # 添加详细的统计信息
-                    wandb.log({
-                        "text_similarity_stats/mean": avg_reward,
-                        "text_similarity_stats/std": std_reward,
-                        "text_similarity_stats/min": min_reward,
-                        "text_similarity_stats/max": max_reward,
-                        "text_similarity_stats/median": sorted(rewards)[len(rewards)//2] if rewards else 0,
-                        "text_similarity_stats/num_samples": len(rewards),
-                    }, step=step_count)
-                    
-                    # 记录一些示例文本的相似度
-                    if rewards:
-                        for i, (comp, sol, reward) in enumerate(zip(completion_texts[:3], solution_texts[:3], rewards[:3])):
-                            wandb.log({
-                                f"text_similarity_examples/example_{i}/completion": comp,
-                                f"text_similarity_examples/example_{i}/solution": sol,
-                                f"text_similarity_examples/example_{i}/similarity": reward,
-                            }, step=step_count)
-                    
-                    logger.info(f"LOG to wandb: text_similarity_reward={avg_reward:.4f} (min={min_reward:.4f}, max={max_reward:.4f}, std={std_reward:.4f}) at step {step_count}")
+                    try:
+                        # 基础指标
+                        wandb.log({
+                            "text_similarity_reward": avg_reward,
+                            "text_similarity_reward_step": step_count,
+                            "text_similarity_rewards_raw": rewards,
+                            "text_similarity_reward_min": min_reward,
+                            "text_similarity_reward_max": max_reward,
+                            "text_similarity_reward_std": std_reward,
+                        }, step=step_count, commit=True)  # 添加commit=True确保立即提交
+                        
+                        # 添加详细的统计信息
+                        wandb.log({
+                            "text_similarity_stats/mean": avg_reward,
+                            "text_similarity_stats/std": std_reward,
+                            "text_similarity_stats/min": min_reward,
+                            "text_similarity_stats/max": max_reward,
+                            "text_similarity_stats/median": sorted(rewards)[len(rewards)//2] if rewards else 0,
+                            "text_similarity_stats/num_samples": len(rewards),
+                        }, step=step_count, commit=True)  # 添加commit=True确保立即提交
+                        
+                        # 记录一些示例文本的相似度
+                        if rewards:
+                            for i, (comp, sol, reward) in enumerate(zip(completion_texts[:3], solution_texts[:3], rewards[:3])):
+                                wandb.log({
+                                    f"text_similarity_examples/example_{i}/completion": comp,
+                                    f"text_similarity_examples/example_{i}/solution": sol,
+                                    f"text_similarity_examples/example_{i}/similarity": reward,
+                                }, step=step_count, commit=True)  # 添加commit=True确保立即提交
+                        
+                        logger.info(f"LOG to wandb: text_similarity_reward={avg_reward:.4f} (min={min_reward:.4f}, max={max_reward:.4f}, std={std_reward:.4f}) at step {step_count}")
+                    except Exception as e:
+                        logger.warning(f"Error logging to wandb: {str(e)[:200]}")
                 
                 return rewards
                 
