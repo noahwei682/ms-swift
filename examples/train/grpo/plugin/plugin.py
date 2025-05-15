@@ -95,9 +95,9 @@ REWARD_WEIGHTS = {
     "repetition_reward": 0.6,    # Repetition penalty
     
     # Additional standard rewards
-    "bm25_reward": 0.2,          # BM25 similarity reward
-    "f1_reward": 0.5,            # F1 score reward
-    "recall_reward": 0.5,        # Recall score reward
+    "bm25_reward": 0.1,          # BM25 similarity reward
+    "f1_reward": 0.7,            # F1 score reward
+    "recall_reward": 0.7,        # Recall score reward
     "precision_reward": 0.5,     # Precision score reward
     "sbert_cosine_reward": 0.5,  # SBERT similarity reward
     
